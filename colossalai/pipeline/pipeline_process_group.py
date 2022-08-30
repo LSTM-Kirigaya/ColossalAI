@@ -86,9 +86,6 @@ class PipelineProcessGroup:
     def get_local_device_mesh_size(self) -> int:
         return self._device_mesh_size
 
-    def get_device_mesh_num(self) -> int:
-        pass
-
     def get_stage_num(self) -> int:
         return self._stage_num
 

@@ -1,6 +1,6 @@
 import threading
 from enum import Enum
-from typing import List, Any, Tuple, Dict
+from typing import List, Any, Tuple, Dict, Callable
 from abc import ABC
 
 import torch
@@ -11,6 +11,7 @@ from torch._C._distributed_rpc import PyRRef
 from torch import autograd
 from torch import optim
 from tqdm import tqdm
+from time import time
 
 from colorama import Back, Style
 
@@ -112,18 +113,6 @@ class BackwardCache:
             setattr(self, arg_name, locals()[arg_name])
 
 
-class RemoteExecutor:
-
-    def __init__(self) -> None:
-        pass
-
-
-class RemoteOptimizer:
-
-    def __init__(self) -> None:
-        pass
-
-
 class Worker:
 
     def __init__(self,
@@ -133,6 +122,7 @@ class Worker:
                  num_microbatches: int,
                  use_1F1B: bool,
                  device: str,
+                 criterion: Callable = None,
                  checkpoint: bool = False) -> None:
         super().__init__()
         self.pp_rank = pp_rank
@@ -157,16 +147,22 @@ class Worker:
 
         # module partitions
         self.module_partition = module_partition.to(device)
+        if criterion:
+            assert callable(criterion)
+        self.criterion = criterion
 
         # container to maintain loop
         self.microbatch_id_to_backward_cache: Dict[int, BackwardCache] = dict()
+        self.microbatch_id_to_labels: Dict[int, Any] = dict()
         self.work_list: Dict[UniqueKey, WorkItem] = dict()
         self.output_list: Dict[UniqueKey, WorkItem] = dict()
 
         # lock for the list
         self.work_list_condition_lock = threading.Condition(threading.Lock())
         self.output_list_condition_lock = threading.Condition(threading.Lock())
+        self.label_lock = threading.Condition(threading.Lock())
 
+        # main loop
         self.main_loop_thread = threading.Thread(target=self._work_loop, name=f'rank_{pp_rank}', daemon=True)
         self.main_loop_thread.start()
 
@@ -235,10 +231,14 @@ class Worker:
             self.work_list_condition_lock.notify_all()
 
     # just for last pp_rank
+    def set_labels(self, microbatch_id: int, microlabels: Any):
+        self.microbatch_id_to_labels[microbatch_id] = microlabels
+
+    # just for last pp_rank
     def _begin_backward(self, microbatch_id: int):
         with self.work_list_condition_lock:
             assert self.producer_stage_ids is not None
-            producer_num = len(self.producer_stage_ids)
+
             key = UniqueKey(microbatch_id, Phase.BACKWARD)
             output = self._get_future_by_device()
             grad_wrt_loss = torch.tensor(1, device=self.device)
@@ -421,7 +421,7 @@ class Worker:
         is_first_stage = (self.pp_rank == 0)
         is_last_stage = (self.pp_rank == self.actual_stage_num - 1)
 
-        # if self.pp_rank == 3:
+        # if self.pp_rank == 1:
         #     print(
         #         f'I am rank_{self.pp_rank} microbatch_id : {microbatch_id} {phase} {self._get_store_len()} | {self.outstanding} {self.outstanding_range}'
         #     )
@@ -495,7 +495,13 @@ class Worker:
             if use_checkpoint:
                 stage_outputs = [self.module_partition(*stage_inputs)]
 
-            autograd.backward(stage_outputs, grad_tensors=grad_tensors)
+            if is_last_stage and not forward_only and self.criterion:
+                labels = self.microbatch_id_to_labels.pop(microbatch_id)
+                stage_loss = self.criterion(stage_outputs, labels)
+            else:
+                stage_loss = stage_outputs
+
+            autograd.backward(stage_loss, grad_tensors=grad_tensors)
 
             # collect grad of input tensor
             consume_result = []
@@ -564,10 +570,12 @@ class PipelineEngineBase(ABC, nn.Module):
                  device: str,
                  use_1F1B=False,
                  chunk: int = 1,
+                 criterion: Callable = None,
                  checkpoint: bool = False) -> None:
         super().__init__()
         self.module_partitions: List[nn.Module] = module_partitions
         self.chunk = chunk
+        self.criterion = criterion
         self.num_microbatches = num_microbatches
         self.device = device
         self.use_1F1B = use_1F1B
@@ -613,6 +621,7 @@ class PipelineEngineBase(ABC, nn.Module):
         checkpoint = self.checkpoint
         num_microbatches = self.num_microbatches
         device = self.device
+        criterion = self.criterion
 
         for pp_rank in range(actual_stage_num):
             module_partition = self.module_partitions[pp_rank]
@@ -622,7 +631,8 @@ class PipelineEngineBase(ABC, nn.Module):
             self.pp_rank_to_worker_rref[pp_rank] = rpc.remote(rpc_worker_id,
                                                               Worker,
                                                               args=(module_partition, pp_rank, actual_stage_num,
-                                                                    num_microbatches, use_1F1B, device, checkpoint))
+                                                                    num_microbatches, use_1F1B, device, criterion,
+                                                                    checkpoint))
 
         # let each worker know global worker rref (include itself)
         for pp_rank in range(actual_stage_num):
@@ -646,12 +656,15 @@ class PipelineEngineBase(ABC, nn.Module):
                 grads[stage_id].append(grad)
         return grads
 
-    def forward_backward(self, batch: torch.Tensor, forward_only: bool = False):
+    def forward_backward(self, batch: torch.Tensor, labels: torch.Tensor = None, forward_only: bool = False):
+        if labels is not None:
+            assert len(batch) == len(labels)
+
         num_microbatches = self.num_microbatches
         microbatch_size = len(batch) // num_microbatches
         actual_stage_num = self._get_actual_stage_num()
 
-        first_stage_worker = self.pp_rank_to_worker_rref[0]
+        first_worker_rref = self.pp_rank_to_worker_rref[0]
         last_worker_rref = self.pp_rank_to_worker_rref[actual_stage_num - 1]
 
         microbatch_iter = range(num_microbatches)
@@ -659,42 +672,45 @@ class PipelineEngineBase(ABC, nn.Module):
             microbatch_iter = tqdm(microbatch_iter)
 
         ret_future: List[Future] = [None] * num_microbatches
-        from time import sleep
 
         for microbatch_id in microbatch_iter:
-            microbatch = batch[microbatch_size * microbatch_id:microbatch_size * (microbatch_id + 1)]
-
             # control data input speed
             # to prevent exceed of wait limitations
-            if microbatch_id >= actual_stage_num:
-                if forward_only or not self.use_1F1B:
-                    ret_future[microbatch_id - actual_stage_num].wait()
-                else:
-                    key = UniqueKey(microbatch_id - actual_stage_num, Phase.BACKWARD)
-                    first_stage_worker.rpc_sync().get_output_by_key(key)
+            # if microbatch_id >= actual_stage_num:
+            #     if forward_only or not self.use_1F1B:
+            #         ret_future[microbatch_id - actual_stage_num].wait()
+            #     else:
+            #         key = UniqueKey(microbatch_id - actual_stage_num, Phase.BACKWARD)
+            #         first_worker_rref.rpc_sync().get_output_by_key(key)
 
-            # run one microbatch
-            first_stage_worker.rpc_sync().set_input(microbatch_id, microbatch, forward_only)
+            # set input
+            microbatch = batch[microbatch_size * microbatch_id:microbatch_size * (microbatch_id + 1)]
+            first_worker_rref.remote().set_input(microbatch_id, microbatch, forward_only)
 
-            key = UniqueKey(microbatch_id, Phase.FORWARD)
-            ret_future[microbatch_id] = last_worker_rref.rpc_async().get_output_by_key(key)
+            # # set labels
+            if not forward_only and labels is not None:
+                microlabels = labels[microbatch_size * microbatch_id:microbatch_size * (microbatch_id + 1)]
+                last_worker_rref.remote().set_labels(microbatch_id, microlabels)
+
+            # key = UniqueKey(microbatch_id, Phase.FORWARD)
+            # ret_future[microbatch_id] = last_worker_rref.rpc_async().get_output_by_key(key)
 
         # wait forward
         # TODO : all the node to output
         forward_result = None
 
-        for microbatch_id in range(self.num_microbatches):
-            key = UniqueKey(microbatch_id, Phase.FORWARD)
-            ret = ret_future[microbatch_id].wait()
-            if forward_result is None:
-                forward_result = [[]] * len(ret)
-            for i in range(len(forward_result)):
-                forward_result[i].append(ret[i])
+        # for microbatch_id in range(self.num_microbatches):
+        #     key = UniqueKey(microbatch_id, Phase.FORWARD)
+        #     ret = ret_future[microbatch_id].wait()
+        #     if forward_result is None:
+        #         forward_result = [[]] * len(ret)
+        #     for i in range(len(forward_result)):
+        #         forward_result[i].append(ret[i])
 
         # wait for last backward in rank0
         if not forward_only:
             key = UniqueKey(self.num_microbatches - 1, Phase.BACKWARD)
-            first_stage_worker.rpc_sync().get_output_by_key(key)
+            first_worker_rref.rpc_sync().get_output_by_key(key)
         return forward_result
 
     def initialize_optimizer(self, optimizer_class: type, **kwargs):
@@ -724,9 +740,10 @@ class FillDrainPipelineEngine(PipelineEngineBase):
                  num_microbatches: int,
                  device: str,
                  chunk: int = 1,
+                 criterion: Callable = None,
                  checkpoint: bool = False) -> None:
         use_1F1B = False
-        super().__init__(module_partitions, stage_num, num_microbatches, device, use_1F1B, chunk, checkpoint)
+        super().__init__(module_partitions, stage_num, num_microbatches, device, use_1F1B, chunk, criterion, checkpoint)
 
 
 class OneFOneBPipelineEngine(PipelineEngineBase):
@@ -737,6 +754,7 @@ class OneFOneBPipelineEngine(PipelineEngineBase):
                  num_microbatches: int,
                  device: str,
                  chunk: int = 1,
+                 criterion: Callable = None,
                  checkpoint: bool = False) -> None:
         use_1F1B = True
-        super().__init__(module_partitions, stage_num, num_microbatches, device, use_1F1B, chunk, checkpoint)
+        super().__init__(module_partitions, stage_num, num_microbatches, device, use_1F1B, chunk, criterion, checkpoint)
