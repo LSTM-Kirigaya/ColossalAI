@@ -31,6 +31,8 @@ def color_debug(text, prefix=' ', color='blue'):
 
 
 def tensor_shape_list(tensors):
+    if isinstance(tensors, (int, float)):
+        return tensors
     if isinstance(tensors, torch.Tensor):
         return tensors.shape
     shapes = []
@@ -40,6 +42,25 @@ def tensor_shape_list(tensors):
         else:
             shapes.append('non tensor')
     return shapes
+
+
+def get_real_args(args):
+    if isinstance(args, torch.Tensor):
+        return args
+    elif isinstance(args, list):
+        real_args = []
+        for arg in args:
+            if isinstance(arg, Future):
+                value = arg.wait()
+            else:
+                value = arg
+            if isinstance(value, list):
+                real_args.extend(value)
+            else:
+                real_args.append(value)
+        return real_args
+    else:
+        raise TypeError(f"Expect receive tensor or list, but receive {type(args)}")
 
 
 class Phase(Enum):
@@ -130,6 +151,7 @@ class Worker:
         self.num_microbatches = num_microbatches
         self.checkpoint = checkpoint
         self.device = device
+        self.use_1F1B = use_1F1B
         self.outstanding_range = self._initialize_outstanding_range(pp_rank, actual_stage_num, use_1F1B)
 
         # variable and const for context managment
@@ -185,20 +207,16 @@ class Worker:
 
     def get_output_by_key(self, key: UniqueKey) -> Any:
         with self.output_list_condition_lock:
-            while key not in self.output_list:
-                self.output_list_condition_lock.wait()
-
+            self.output_list_condition_lock.wait_for(lambda: key in self.output_list)
             output_work_item = self.output_list[key]
-
         output = output_work_item.output.wait()
         # color_debug(f'rank {self.pp_rank}, output {type(output)}', 'get output', 'red')
         output_work_item.refcount += 1
 
         # all consumers have been satisfied, the work_item can be released
         with self.output_list_condition_lock:
-            if output_work_item.refcount == len(self.consumer_stage_ids):
+            if output_work_item.refcount >= len(self.consumer_stage_ids):
                 self.output_list.pop(key)
-
         return output
 
     def get_parameters(self) -> List[torch.Tensor]:
@@ -207,26 +225,16 @@ class Worker:
     def get_parameter_gradients(self) -> List[torch.Tensor]:
         return [p.grad for p in self.module_partition.parameters()]
 
-    def reset_pp_context(self):
-        self.forward_times = 0
-        self.backward_times = 0
-        self.outstanding = 0
-        self.microbatch_id_to_backward_cache.clear()
-        self.output_list.clear()
-
     # just for first pp_rank
     def set_input(self, microbatch_id: int, microbatch: Tuple[Any], forward_only: bool):
+        assert self.consumer_stage_ids is not None
+        key = UniqueKey(microbatch_id, Phase.FORWARD)
+        output = self._get_future_by_device()
+        args = [microbatch] if isinstance(microbatch, torch.Tensor) else microbatch
+        work_item = WorkItem(self.pp_rank, Phase.FORWARD, args, {}, output, microbatch_id, None, self.num_microbatches,
+                             forward_only)
         with self.work_list_condition_lock:
-            assert self.consumer_stage_ids is not None
-            consumer_num = len(self.consumer_stage_ids)
-            key = UniqueKey(microbatch_id, Phase.FORWARD)
-            output = self._get_future_by_device()
-            args = [microbatch] if isinstance(microbatch, torch.Tensor) else microbatch
-
-            work_item = WorkItem(self.pp_rank, Phase.FORWARD, args, {}, output, microbatch_id, None,
-                                 self.num_microbatches, forward_only)
             self.work_list[key] = work_item
-
             color_debug(f'rank {self.pp_rank} receive data from dataloader', 'data dispatch', 'magenta')
             self.work_list_condition_lock.notify_all()
 
@@ -272,15 +280,10 @@ class Worker:
         color_debug(f'rank {self.pp_rank} get {len(subscribe_forward_futures)} futs from its producer', 'data dispatch',
                     'magenta')
 
-        args = []
-        for i in range(producer_num):
-            producer_args = subscribe_forward_futures[i].wait()
-            args.extend(producer_args)
+        work_item_from_producer = WorkItem(stage_id, Phase.FORWARD, subscribe_forward_futures, {}, output,
+                                           microbatch_id, None, self.num_microbatches, forward_only)
 
-        work_item_from_producer = WorkItem(stage_id, Phase.FORWARD, args, {}, output, microbatch_id, None,
-                                           self.num_microbatches, forward_only)
-
-        color_debug(f'rank {self.pp_rank} get value {tensor_shape_list(args)} from fut', 'data dispatch', 'magenta')
+        # color_debug(f'rank {self.pp_rank} get value {tensor_shape_list(args)} from fut', 'data dispatch', 'magenta')
         # add work_item to work_list
         with self.work_list_condition_lock:
             key = UniqueKey(microbatch_id, Phase.FORWARD)
@@ -312,16 +315,11 @@ class Worker:
             consumer_worker_rref = self.pp_rank_to_worker_rref[consumer_stage_id]
             subscribe_backward_futures[i] = consumer_worker_rref.rpc_async().get_output_by_key(consumer_output_key)
 
-        args = []
-        for i in range(consumer_num):
-            consumer_args = subscribe_backward_futures[i].wait()
-            args.extend(consumer_args)
-
         # flatten args
-        work_item_from_consumer = WorkItem(stage_id, Phase.BACKWARD, args, {}, output, microbatch_id, None,
-                                           self.num_microbatches, False)
+        work_item_from_consumer = WorkItem(stage_id, Phase.BACKWARD, subscribe_backward_futures, {}, output,
+                                           microbatch_id, None, self.num_microbatches, False)
 
-        color_debug(f'rank {self.pp_rank} get value {tensor_shape_list(args)} from fut', 'data dispatch', 'magenta')
+        # color_debug(f'rank {self.pp_rank} get value {tensor_shape_list(args)} from fut', 'data dispatch', 'magenta')
 
         # add work_item to work_list
         with self.work_list_condition_lock:
@@ -351,63 +349,50 @@ class Worker:
             self.consumer_stage_ids.append(next_rank)
 
     def _get_work_item_key(self) -> UniqueKey:
-        with self.work_list_condition_lock:
-            while len(self.work_list) == 0:
-                self.work_list_condition_lock.wait()
+        # execute backward first (if backward phase in work_list)
+        pp_rank = self.pp_rank
+        actual_stage_num = self.actual_stage_num
+        num_microbatches = self.num_microbatches
+        is_last_stage = pp_rank == actual_stage_num - 1
 
-            # each stage must do Key(microbatch_id=0, phase=FORWARD) first
-            # before doing the operation, reset the context first
-            if self.reset_key in self.work_list:
-                self.reset_pp_context()
-
-            # execute backward first (if backward phase in work_list)
-            pp_rank = self.pp_rank
-            actual_stage_num = self.actual_stage_num
-            num_microbatches = self.num_microbatches
-            is_last_stage = pp_rank == actual_stage_num - 1
-            select_work_list_key: UniqueKey = None
-
-            if self.outstanding_range:
-                if self.outstanding <= self.outstanding_range[0]:
-                    target_phase = Phase.FORWARD
-                    target_microbatch_id = self.forward_times
-                elif self.outstanding >= self.outstanding_range[1]:
-                    target_phase = Phase.BACKWARD
-                    target_microbatch_id = self.backward_times
-                else:
-                    raise ValueError("outstanding_range[1] - outstanding_range[0] must be in [0, 1]")
-
-                target_key = UniqueKey(target_microbatch_id, target_phase)
-                if target_key in self.work_list:
-                    select_work_list_key = target_key
-
-                # change outstanding_range at:
-                # 1. forward times reach actual_stage_num, this is the end of continuous forward
-                # 2. forward times reach num_microbatches, this is the end of 1F1B mode
-                if not is_last_stage and \
-                    select_work_list_key is not None and \
-                    select_work_list_key.phase == Phase.FORWARD:
-                    if select_work_list_key.microbatch_id == actual_stage_num - 1:
-                        outstanding_min = actual_stage_num - pp_rank - 1
-                        outstanding_max = actual_stage_num - pp_rank
-                        self.outstanding_range = (outstanding_min, outstanding_max)
-                    elif select_work_list_key.microbatch_id == num_microbatches - 1:
-                        self.outstanding_range = (0, 0)
-
+        if self.outstanding_range:
+            if self.outstanding <= self.outstanding_range[0]:
+                target_phase = Phase.FORWARD
+                target_microbatch_id = self.forward_times
+            elif self.outstanding >= self.outstanding_range[1]:
+                target_phase = Phase.BACKWARD
+                target_microbatch_id = self.backward_times
             else:
-                if self.forward_times < num_microbatches:
-                    target_phase = Phase.FORWARD
-                    target_microbatch_id = self.forward_times
-                else:
-                    target_phase = Phase.BACKWARD
-                    target_microbatch_id = self.backward_times
+                raise ValueError("outstanding_range[1] - outstanding_range[0] must be in [0, 1]")
 
-                target_key = UniqueKey(target_microbatch_id, target_phase)
+            target_key = UniqueKey(target_microbatch_id, target_phase)
 
-                if target_key in self.work_list:
-                    select_work_list_key = target_key
+            # change outstanding_range at:
+            # 1. forward times reach actual_stage_num, this is the end of continuous forward
+            # 2. forward times reach num_microbatches, this is the end of 1F1B mode
+            if not is_last_stage and \
+                target_key.phase == Phase.FORWARD:
+                if target_key.microbatch_id == actual_stage_num - 1:
+                    outstanding_min = actual_stage_num - pp_rank - 1
+                    outstanding_max = actual_stage_num - pp_rank
+                    self.outstanding_range = (outstanding_min, outstanding_max)
+                elif target_key.microbatch_id == num_microbatches - 1:
+                    self.outstanding_range = (0, 0)
 
-        return select_work_list_key
+        else:
+            if self.forward_times < num_microbatches:
+                target_phase = Phase.FORWARD
+                target_microbatch_id = self.forward_times
+            else:
+                target_phase = Phase.BACKWARD
+                target_microbatch_id = self.backward_times
+
+            target_key = UniqueKey(target_microbatch_id, target_phase)
+
+        with self.work_list_condition_lock:
+            self.work_list_condition_lock.wait_for(lambda: target_key in self.work_list)
+
+        return target_key
 
     def _consume_work_item_by_phase(self, work_item: WorkItem):
         phase = work_item.phase
@@ -421,7 +406,7 @@ class Worker:
         is_first_stage = (self.pp_rank == 0)
         is_last_stage = (self.pp_rank == self.actual_stage_num - 1)
 
-        # if self.pp_rank == 1:
+        # if self.pp_rank == 0:
         #     print(
         #         f'I am rank_{self.pp_rank} microbatch_id : {microbatch_id} {phase} {self._get_store_len()} | {self.outstanding} {self.outstanding_range}'
         #     )
@@ -436,12 +421,7 @@ class Worker:
 
             if not forward_only:
                 self.outstanding += 1
-
-            # TODO : more elegant ?
-            for i in range(len(args)):
-                arg_obj = args[i]
-                if isinstance(arg_obj, torch.Tensor) and not arg_obj.requires_grad:
-                    args[i] = arg_obj.requires_grad_()
+            args = get_real_args(args)
 
             # last stage doesn't need to do checkpoint, for it will do backward instantly
             if forward_only:
@@ -458,7 +438,14 @@ class Worker:
                 use_checkpoint = True
             else:
                 consume_result = self.module_partition(*args, **kwargs)
-                stage_outputs = consume_result
+                if is_last_stage and self.criterion:
+                    labels = self.microbatch_id_to_labels.pop(microbatch_id)
+                    loss = self.criterion(consume_result, labels)
+                    consume_result = loss.item()
+                else:
+                    loss = consume_result
+
+                stage_outputs = loss
                 stage_inputs = args
                 use_checkpoint = False
 
@@ -467,7 +454,8 @@ class Worker:
                                                                                     stage_outputs,
                                                                                     checkpoint=use_checkpoint)
 
-            consume_result = [consume_result] if isinstance(consume_result, torch.Tensor) else consume_result
+            consume_result = [consume_result] if isinstance(consume_result,
+                                                            (torch.Tensor, int, float)) else consume_result
 
             # if not forward_only, do the backward
             if not forward_only:
@@ -488,34 +476,27 @@ class Worker:
 
             stage_outputs = backward_cache.stage_outputs
             stage_inputs = backward_cache.stage_inputs
-            grad_tensors = args
-
             use_checkpoint = backward_cache.checkpoint
 
             if use_checkpoint:
                 stage_outputs = [self.module_partition(*stage_inputs)]
+            # overlap recompute and future.wait
+            grad_tensors = get_real_args(args)
 
-            if is_last_stage and not forward_only and self.criterion:
-                labels = self.microbatch_id_to_labels.pop(microbatch_id)
-                stage_loss = self.criterion(stage_outputs, labels)
-            else:
-                stage_loss = stage_outputs
-
-            autograd.backward(stage_loss, grad_tensors=grad_tensors)
+            autograd.backward(stage_outputs, grad_tensors=grad_tensors)
 
             # collect grad of input tensor
             consume_result = []
             for input_node in stage_inputs:
                 if isinstance(input_node, torch.Tensor):
                     consume_result.append(input_node.grad)
-
         else:
             raise TypeError(f"Unknown phase appears in _consume_work_item_by_phase {phase}")
 
         return consume_result
 
     def _get_store_len(self):
-        return f'work_list:{len(self.work_list)} output_list:{len(self.output_list)} backward_cache:{len(self.microbatch_id_to_backward_cache)}'
+        return f'work_list:{len(self.work_list)} output_list:{len(self.output_list)} backward_cache:{len(self.microbatch_id_to_backward_cache)} label_cache:{len(self.microbatch_id_to_labels)}'
 
     # do the main loop to consume ready_list
     def _work_loop(self):
@@ -525,8 +506,6 @@ class Worker:
         # main loop
         while True:
             work_item_key = self._get_work_item_key()
-            if work_item_key is None:
-                continue
 
             # move current work item to output_list to activate subscribe in advance
             with self.work_list_condition_lock:
@@ -543,6 +522,13 @@ class Worker:
 
             consume_result = self._consume_work_item_by_phase(work_item)
 
+            if work_item.phase == Phase.BACKWARD and work_item.microbatch_id == self.num_microbatches - 1:
+                self.forward_times = 0
+                self.backward_times = 0
+                self.outstanding = 0
+                self.outstanding_range = self._initialize_outstanding_range(self.pp_rank, self.actual_stage_num,
+                                                                            self.use_1F1B)
+
             color_debug(
                 f'rank_{self.pp_rank} [{work_item.phase}] finish consuming, result is {tensor_shape_list(consume_result)} {self._get_store_len()}',
                 'work loop', 'green')
@@ -553,10 +539,7 @@ class Worker:
 
     def step(self):
         assert hasattr(self, "optimizer"), "call initialize_optimizer first before you call step!"
-        self.work_list.clear()
         self.output_list.clear()
-        self.microbatch_id_to_backward_cache.clear()
-
         self.optimizer.step()
         self.optimizer.zero_grad()
 
@@ -584,6 +567,8 @@ class PipelineEngineBase(ABC, nn.Module):
         self.use_interleave = chunk > 1
 
         self.pp_rank_to_worker_rref: Dict[int, PyRRef] = dict()
+
+        self.step_futs: List[Future] = []
 
         self._check_argument()
         self._create_pp_rank_to_rpc_worker_id()
@@ -672,63 +657,62 @@ class PipelineEngineBase(ABC, nn.Module):
             microbatch_iter = tqdm(microbatch_iter)
 
         ret_future: List[Future] = [None] * num_microbatches
-
         for microbatch_id in microbatch_iter:
             # control data input speed
             # to prevent exceed of wait limitations
-            # if microbatch_id >= actual_stage_num:
-            #     if forward_only or not self.use_1F1B:
-            #         ret_future[microbatch_id - actual_stage_num].wait()
-            #     else:
-            #         key = UniqueKey(microbatch_id - actual_stage_num, Phase.BACKWARD)
-            #         first_worker_rref.rpc_sync().get_output_by_key(key)
+            if microbatch_id >= actual_stage_num:
+                if forward_only or not self.use_1F1B:
+                    ret_future[microbatch_id - actual_stage_num].wait()
+                else:
+                    key = UniqueKey(microbatch_id - actual_stage_num, Phase.BACKWARD)
+                    first_worker_rref.rpc_sync().get_output_by_key(key)
 
             # set input
             microbatch = batch[microbatch_size * microbatch_id:microbatch_size * (microbatch_id + 1)]
-            first_worker_rref.remote().set_input(microbatch_id, microbatch, forward_only)
-
-            # # set labels
+            microbatch = microbatch.cuda()
+            first_worker_rref.rpc_sync().set_input(microbatch_id, microbatch, forward_only)
+            # set labels
             if not forward_only and labels is not None:
                 microlabels = labels[microbatch_size * microbatch_id:microbatch_size * (microbatch_id + 1)]
+                microlabels = microlabels.cuda()
                 last_worker_rref.remote().set_labels(microbatch_id, microlabels)
 
-            # key = UniqueKey(microbatch_id, Phase.FORWARD)
-            # ret_future[microbatch_id] = last_worker_rref.rpc_async().get_output_by_key(key)
-
-        # wait forward
-        # TODO : all the node to output
-        forward_result = None
-
-        # for microbatch_id in range(self.num_microbatches):
-        #     key = UniqueKey(microbatch_id, Phase.FORWARD)
-        #     ret = ret_future[microbatch_id].wait()
-        #     if forward_result is None:
-        #         forward_result = [[]] * len(ret)
-        #     for i in range(len(forward_result)):
-        #         forward_result[i].append(ret[i])
+            key = UniqueKey(microbatch_id, Phase.FORWARD)
+            ret_future[microbatch_id] = last_worker_rref.rpc_async().get_output_by_key(key)
 
         # wait for last backward in rank0
         if not forward_only:
             key = UniqueKey(self.num_microbatches - 1, Phase.BACKWARD)
             first_worker_rref.rpc_sync().get_output_by_key(key)
+
+        # collect forward result
+        # TODO : all the node to output
+        forward_result = None
+
+        for microbatch_id in range(self.num_microbatches):
+            key = UniqueKey(microbatch_id, Phase.FORWARD)
+            ret = ret_future[microbatch_id].wait()
+            if forward_result is None:
+                forward_result = [[]] * len(ret)
+            for i in range(len(forward_result)):
+                forward_result[i].append(ret[i])
+
         return forward_result
 
     def initialize_optimizer(self, optimizer_class: type, **kwargs):
         actual_stage_num = self._get_actual_stage_num()
         for pp_rank in range(actual_stage_num):
             worker_rref = self.pp_rank_to_worker_rref[pp_rank]
-            worker_rref.rpc_sync().initialize_optimizer(optimizer_class, **kwargs)
+            worker_rref.remote().initialize_optimizer(optimizer_class, **kwargs)
 
     def step(self):
-        step_futs: List[Future] = []
         actual_stage_num = self._get_actual_stage_num()
         for pp_rank in range(actual_stage_num):
             worker_rref = self.pp_rank_to_worker_rref[pp_rank]
             fut = worker_rref.rpc_async().step()
-            step_futs.append(fut)
+            self.step_futs.append(fut)
 
-        # wait for all optimizers
-        for fut in step_futs:
+        for fut in self.step_futs:
             fut.wait()
 
 

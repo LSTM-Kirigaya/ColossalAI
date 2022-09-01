@@ -80,12 +80,15 @@ def run_master(args):
     from time import time
     s = time()
     for bx, by in tqdm(train_dataloader):
-        bx = bx.cuda()
-        by = by.cuda()
+        print("before", torch.cuda.max_memory_reserved())
         pp_engine.forward_backward(bx, labels=by, forward_only=False)
         pp_engine.step()
-    print()
-    print(time() - s)
+        print("after ", torch.cuda.max_memory_reserved())
+
+    cost_time = time() - s
+
+    print("total cost time :", cost_time)
+    print("cost time per batch:", cost_time / len(train_dataloader))
 
 
 if __name__ == '__main__':
