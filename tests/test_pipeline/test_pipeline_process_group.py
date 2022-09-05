@@ -6,7 +6,7 @@ import torch.multiprocessing as mp
 from colossalai.pipeline.pipeline_process_group import PipelineProcessGroup
 from colossalai.initialize import launch
 from colossalai.logging import disable_existing_loggers
-from rpc_test_utils import test_pg_parse_args, rpc_is_initialized
+from rpc_test_utils import pg_parse_args, rpc_is_initialized
 
 
 def run_worker(rank, args):
@@ -37,6 +37,6 @@ def run_worker(rank, args):
 
 
 if __name__ == "__main__":
-    args = test_pg_parse_args()
+    args = pg_parse_args()
     world_size = args.world_size
     mp.spawn(run_worker, args=(args,), nprocs=world_size)

@@ -2,6 +2,7 @@ import threading
 from enum import Enum
 from typing import List, Any, Tuple, Dict, Callable
 from abc import ABC
+import sys
 
 import torch
 from torch import nn
@@ -31,6 +32,8 @@ def color_debug(text, prefix=' ', color='blue'):
 
 
 def tensor_shape_list(tensors):
+    if tensors is None:
+        return None
     if isinstance(tensors, (int, float)):
         return tensors
     if isinstance(tensors, torch.Tensor):
@@ -152,7 +155,7 @@ class Worker:
         self.checkpoint = checkpoint
         self.device = device
         self.use_1F1B = use_1F1B
-        self.outstanding_range = self._initialize_outstanding_range(pp_rank, actual_stage_num, use_1F1B)
+        self._initialize_outstanding_range()
 
         # variable and const for context managment
         self.outstanding = 0
@@ -184,6 +187,9 @@ class Worker:
         self.output_list_condition_lock = threading.Condition(threading.Lock())
         self.label_lock = threading.Condition(threading.Lock())
 
+        self.step_lock = threading.Lock()
+        self.step_lock.acquire()
+
         # main loop
         self.main_loop_thread = threading.Thread(target=self._work_loop, name=f'rank_{pp_rank}', daemon=True)
         self.main_loop_thread.start()
@@ -191,14 +197,14 @@ class Worker:
     def _get_future_by_device(self):
         return torch.futures.Future(devices=None if self.device in (None, 'cpu') else [self.device])
 
-    def _initialize_outstanding_range(self, pp_rank: int, actual_stage_num: int, use_1F1B: bool) -> Tuple[int]:
+    def _initialize_outstanding_range(self):
         outstanding_range = None
-        if use_1F1B:
-            if pp_rank == actual_stage_num - 1:
+        if self.use_1F1B:
+            if self.pp_rank == self.actual_stage_num - 1:
                 outstanding_range = (0, 1)
             else:
-                outstanding_range = (actual_stage_num, actual_stage_num)
-        return outstanding_range
+                outstanding_range = (self.actual_stage_num, self.actual_stage_num)
+        self.outstanding_range = outstanding_range
 
     def sync_global_worker_rrefs(self, pp_rank_to_worker_rref: Dict[int, PyRRef]) -> None:
         assert self.pp_rank_to_worker_rref is None, f"in rank {self.pp_rank}, worker has sync global workers rrefs"
@@ -440,7 +446,7 @@ class Worker:
                 consume_result = self.module_partition(*args, **kwargs)
                 if is_last_stage and self.criterion:
                     labels = self.microbatch_id_to_labels.pop(microbatch_id)
-                    loss = self.criterion(consume_result, labels)
+                    loss: torch.Tensor = self.criterion(consume_result, labels)
                     consume_result = loss.item()
                 else:
                     loss = consume_result
@@ -487,9 +493,11 @@ class Worker:
 
             # collect grad of input tensor
             consume_result = []
-            for input_node in stage_inputs:
-                if isinstance(input_node, torch.Tensor):
-                    consume_result.append(input_node.grad)
+            if not is_first_stage:
+                for input_node in stage_inputs:
+                    if isinstance(input_node, torch.Tensor):
+                        consume_result.append(input_node.grad)
+
         else:
             raise TypeError(f"Unknown phase appears in _consume_work_item_by_phase {phase}")
 
@@ -497,6 +505,19 @@ class Worker:
 
     def _get_store_len(self):
         return f'work_list:{len(self.work_list)} output_list:{len(self.output_list)} backward_cache:{len(self.microbatch_id_to_backward_cache)} label_cache:{len(self.microbatch_id_to_labels)}'
+
+    def _get_parameter_grad_sum(self):
+        grad_sum = 0
+        for p in self.module_partition.parameters():
+            if p.grad is not None:
+                grad_sum += p.grad.sum()
+        return grad_sum
+
+    def _is_first_step(self, work_item) -> bool:
+        return work_item.phase == Phase.FORWARD and work_item.microbatch_id == 0
+
+    def _is_last_step(self, work_item) -> bool:
+        return work_item.phase == Phase.BACKWARD and work_item.microbatch_id == self.num_microbatches - 1
 
     # do the main loop to consume ready_list
     def _work_loop(self):
@@ -522,26 +543,34 @@ class Worker:
 
             consume_result = self._consume_work_item_by_phase(work_item)
 
-            if work_item.phase == Phase.BACKWARD and work_item.microbatch_id == self.num_microbatches - 1:
-                self.forward_times = 0
-                self.backward_times = 0
-                self.outstanding = 0
-                self.outstanding_range = self._initialize_outstanding_range(self.pp_rank, self.actual_stage_num,
-                                                                            self.use_1F1B)
-
             color_debug(
                 f'rank_{self.pp_rank} [{work_item.phase}] finish consuming, result is {tensor_shape_list(consume_result)} {self._get_store_len()}',
                 'work loop', 'green')
+
             work_item.output.set_result(consume_result)
+
+            # if is last step in one batch reset context and do step
+            if self._is_last_step(work_item):
+                if hasattr(self, 'optimizer'):
+                    self.step()
+                self.forward_times = 0
+                self.backward_times = 0
+                self.outstanding = 0
+                self._initialize_outstanding_range()
 
     def initialize_optimizer(self, optimizer_class: type, **kwargs):
         self.optimizer: optim.Optimizer = optimizer_class(self.module_partition.parameters(), **kwargs)
 
+    def wait_for_step(self):
+        self.step_lock.acquire()
+
     def step(self):
-        assert hasattr(self, "optimizer"), "call initialize_optimizer first before you call step!"
-        self.output_list.clear()
+        # print(f'rank_{self.pp_rank}', sum([p.sum() for p in self.module_partition.parameters()]))
         self.optimizer.step()
+        # print(f'rank_{self.pp_rank}', sum([p.sum() for p in self.module_partition.parameters()]))
         self.optimizer.zero_grad()
+
+        self.step_lock.release()
 
 
 class PipelineEngineBase(ABC, nn.Module):
@@ -670,7 +699,7 @@ class PipelineEngineBase(ABC, nn.Module):
             # set input
             microbatch = batch[microbatch_size * microbatch_id:microbatch_size * (microbatch_id + 1)]
             microbatch = microbatch.cuda()
-            first_worker_rref.rpc_sync().set_input(microbatch_id, microbatch, forward_only)
+            first_worker_rref.remote().set_input(microbatch_id, microbatch, forward_only)
             # set labels
             if not forward_only and labels is not None:
                 microlabels = labels[microbatch_size * microbatch_id:microbatch_size * (microbatch_id + 1)]
@@ -697,10 +726,18 @@ class PipelineEngineBase(ABC, nn.Module):
             for i in range(len(forward_result)):
                 forward_result[i].append(ret[i])
 
+        if hasattr(self, 'optimizer_class'):
+            # wait for all step
+            # TODO : more elegant ?
+            for pp_rank in self.pp_rank_to_worker_rref:
+                worker_rref = self.pp_rank_to_worker_rref[pp_rank]
+                worker_rref.rpc_sync().wait_for_step()
+
         return forward_result
 
     def initialize_optimizer(self, optimizer_class: type, **kwargs):
         actual_stage_num = self._get_actual_stage_num()
+        self.optimizer_class = optimizer_class
         for pp_rank in range(actual_stage_num):
             worker_rref = self.pp_rank_to_worker_rref[pp_rank]
             worker_rref.remote().initialize_optimizer(optimizer_class, **kwargs)

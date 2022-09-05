@@ -77,15 +77,12 @@ def run_master(args):
                                        checkpoint=False)
 
     pp_engine.initialize_optimizer(torch.optim.Adam, lr=1e-3)
-    from time import time
-    s = time()
-    for bx, by in tqdm(train_dataloader):
-        print("before", torch.cuda.max_memory_reserved())
-        pp_engine.forward_backward(bx, labels=by, forward_only=False)
-        pp_engine.step()
-        print("after ", torch.cuda.max_memory_reserved())
+    s = time.time()
 
-    cost_time = time() - s
+    for bx, by in tqdm(train_dataloader):
+        pp_engine.forward_backward(bx, labels=by, forward_only=False)
+
+    cost_time = time.time() - s
 
     print("total cost time :", cost_time)
     print("cost time per batch:", cost_time / len(train_dataloader))
