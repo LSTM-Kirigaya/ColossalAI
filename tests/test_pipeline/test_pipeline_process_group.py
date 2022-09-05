@@ -2,6 +2,7 @@ import os
 
 import torch.distributed.rpc as rpc
 import torch.multiprocessing as mp
+import pytest
 
 from colossalai.pipeline.pipeline_process_group import PipelineProcessGroup
 from colossalai.initialize import launch
